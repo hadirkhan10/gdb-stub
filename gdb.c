@@ -27,6 +27,39 @@ uint8_t gdb_checksum(const char *buf, const size_t size) {
 }
 
 
+ssize_t gdb_escape (char *dst, const size_t dst_size, const char *src, const size_t src_len) {
+    unsigned char *udst = (unsigned char *) dst;
+    const unsigned char *usrc = (const unsigned char *) src;
+    size_t js = 0, jd = 0;
+
+    while (js < src_len) {
+	unsigned char ch = usrc [js];
+	if ((ch == '$') || (ch == '#') || (ch == '*') || (ch == '}')) {
+	    if ((jd + 1) >= dst_size)
+		goto err_dst_too_small;
+	    dst [jd]     = '}';
+	    udst [jd + 1] = (ch ^ 0x20);
+	    jd += 2;
+	}
+	else {
+	    if (jd >= dst_size)
+		goto err_dst_too_small;
+	    udst [jd] = ch;
+	    jd += 1;
+	}
+	js++;
+    }
+    return (ssize_t) jd;
+
+ err_dst_too_small:
+	printf ("ERROR: destination buffer too small\n");
+    return -1;
+}
+
+
+
+
+
 ssize_t gdb_unescape(char *dst, const size_t dst_size, const char *src, const size_t src_len) {
  unsigned char *udst = (unsigned char *) dst;
     const unsigned char *usrc = (const unsigned char *) src;
@@ -65,14 +98,8 @@ ssize_t gdb_unescape(char *dst, const size_t dst_size, const char *src, const si
     return -1;
 }
 
-
-
-
-
-
 char recv_ack_nack(void) {
-	//const size_t n_iters_max = 1000000;
-	const size_t n_iters_max = 10;
+	const size_t n_iters_max = 1000000;
     size_t n_iters = 0;
 	char ack_resp;
 
@@ -109,6 +136,70 @@ char recv_ack_nack(void) {
 
 }
 
+int send_rsp_pkt_to_gdb(const char *buf, const size_t buf_len) {
+	char wire_buf[GDB_RSP_WIRE_BUF_MAX];
+	wire_buf[0] = '$';
+	
+	ssize_t s_wire_len = gdb_escape(&(wire_buf[1]), (GDB_RSP_WIRE_BUF_MAX - 1), buf, buf_len);
+
+	if ((s_wire_len < 0) || ((s_wire_len + 4) >= GDB_RSP_WIRE_BUF_MAX)) {
+		printf("ERROR: packet too large\n");
+		goto err_exit;
+	}
+
+	size_t wire_len = (size_t) s_wire_len;
+	
+	// compute and insert the checksum
+	uint8_t checksum = gdb_checksum(&(wire_buf[1]), wire_len);
+	char ckstr[3];
+	snprintf(ckstr, sizeof(ckstr), "%02X", checksum);
+	wire_buf[wire_len + 1] = '#';
+	wire_buf[wire_len + 2] = ckstr[0];
+	wire_buf[wire_len + 3] = ckstr[1];
+	
+
+	while (true) {
+		// Write the packet out to GDB
+		size_t n_sent = 0;
+		size_t n_iters = 0;
+		while (n_sent < (wire_len + 4)) {
+		    ssize_t n = write (conn_sock, & (wire_buf [n_sent]), (wire_len + 4 - n_sent));
+		    if (n < 0) {
+			    printf ("ERROR: write (wire_buf) to gdb failed\n");
+				goto err_exit;
+		    }
+		    else if (n == 0) {
+				if (n_iters > 1000000) {
+					printf ("ERROR: nothing sent in 1,000,000 write () attempts\n");
+				    goto err_exit;
+				}
+				usleep (5);
+				n_iters++;
+		    }
+		    else {
+				n_sent += (size_t) n;
+		    }
+		}
+
+		// Receive '+' (ack) or '-' (nak) from GDB
+		char ch = recv_ack_nack();
+		if (ch == '+') {
+			printf("Received ack ('+') from GDB \n");
+		    return 1;
+		} else {
+			printf ("Received nak ('-') from GDB\n");
+		    continue; // goto err_exit;
+		}
+   	}	
+
+	err_exit:
+    	return -1;
+		
+}
+
+
+
+
 
 int send_ack_nak(char ack_char) {
 	size_t n_iters = 0;
@@ -136,7 +227,7 @@ ssize_t recv_rsp_pkt_gdb(char *buf, const size_t buf_size) {
 	char wire_buf[GDB_RSP_WIRE_BUF_MAX];
 	size_t free_ptr = 0;
 	ssize_t n;
-	
+
 	n = read(conn_sock, &(wire_buf[free_ptr]), (GDB_RSP_WIRE_BUF_MAX - free_ptr));
 	if (n < 0) {
 		if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
@@ -153,6 +244,9 @@ ssize_t recv_rsp_pkt_gdb(char *buf, const size_t buf_size) {
 		free_ptr += (size_t) n;
 	}
 
+
+
+
 	size_t start = 0;
 	while((wire_buf[start] != '$') && (wire_buf[start] != control_c) && (start < free_ptr)) {
 		start++;
@@ -167,6 +261,7 @@ ssize_t recv_rsp_pkt_gdb(char *buf, const size_t buf_size) {
 	
 	if (free_ptr == 0) {
 		// no '$' or '^C' found
+		printf("No '$' or '^C' found\n");
 		return 0;
 	}
 
@@ -245,6 +340,31 @@ ssize_t recv_rsp_pkt_gdb(char *buf, const size_t buf_size) {
 }
 
 
+void handle_rsp_stop_reason(const char *buf, const size_t buf_len) {
+	char response[8];
+	snprintf(response, 8, "T%02x", 0x05);
+	send_rsp_pkt_to_gdb(response, strlen(response));
+}
+
+
+
+void handle_rsp_q(const char *buf, const size_t buf_len) {
+	printf("The handle rsp q function was called. \n");
+	if (strncmp("qSupported", buf, strlen("qSupported")) == 0) {
+		char response [32];
+		snprintf(response, 32, "PacketSize=%x", GDB_RSP_PKT_BUF_MAX);
+		send_rsp_pkt_to_gdb(response, strlen(response));
+	} else if (strncmp("qTStatus", buf, strlen("qTStatus")) == 0) {
+		printf("Got qTStatus demand from gdb. Need to implement response from it\n");
+		char response [32];
+		snprintf(response, 32, "T%d", 0);
+		send_rsp_pkt_to_gdb(response, strlen(response));
+	} else {
+		char response[] = "";
+		send_rsp_pkt_to_gdb(response, strlen(response));
+	 }
+}
+
 int main(int argc, char const *argv[]) {
 	int server_fd;     
 	struct sockaddr_in address;
@@ -290,14 +410,58 @@ int main(int argc, char const *argv[]) {
 
 	while(true) {
 		ssize_t sn = recv_rsp_pkt_gdb(gdb_rsp_pkt_buf, GDB_RSP_PKT_BUF_MAX);		
-		// CONTINUE fROM HERE TOMORROW
-	}	
+		printf("value of sn is: %ld\n", sn);
+		if (sn < 0) {
+			printf("ERROR: on receiving response packet from GDB\n");
+			break;
+		} else if (sn == 0) {
+			// complete packet not yet arrived from the GDB
+			usleep(10);
+			continue;
+		} else {
+			size_t n = (size_t) sn;
+			if (gdb_rsp_pkt_buf [0] == control_c) {
+				printf("got control c\n");
+        	} else if (gdb_rsp_pkt_buf [0] == '?') {
+				printf("got ?\n");
+				handle_rsp_stop_reason(gdb_rsp_pkt_buf, n);
+        	} else if (gdb_rsp_pkt_buf [0] == 'c') {
+				printf("got c\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'D') {
+				printf("got D\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'g') {
+				printf("got g\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'G') {
+				printf("got G\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'm') {
+				printf("got m\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'M') {
+				printf("got M\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'p') {
+				printf("got p\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'P') {
+				printf("got P\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'q') {
+				printf("got q\n");
+				handle_rsp_q(gdb_rsp_pkt_buf, n);
+        	} else if (gdb_rsp_pkt_buf [0] == 's') {
+				printf("got s\n");
+        	} else if (gdb_rsp_pkt_buf [0] == 'X') {
+				printf("got X\n");
+        	} else {
+				printf("WARNING: Unrecognized packet\n");
+       	    	send_rsp_pkt_to_gdb("", 0);
+			}
+
+
+    	}
+	}
+		
 
 
 	done:
-		exit(EXIT_FAILURE);
+		close(conn_sock);
 
 	return 0;
-
 }
 
