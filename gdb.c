@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <assert.h>
 #define PORT 1234
 #define GDB_RSP_PKT_BUF_MAX (16384)
 #define GDB_RSP_WIRE_BUF_MAX ((GDB_RSP_PKT_BUF_MAX * 2) + 4)
@@ -15,7 +16,37 @@
 static int conn_sock;
 static const char control_c = 0x3;
 
+const char hexchars[] = "0123456789abcdef";
 
+void val_to_hex16 (const uint64_t val, const uint8_t xlen, char *buf) {
+    assert ((xlen == 8)
+	    || (xlen == 16)
+	    || (xlen == 32)
+	    || (xlen == 64));
+
+    buf[0]  = hexchars [(val >>  4) & 0xF];
+    buf[1]  = hexchars [(val >>  0) & 0xF];
+    if (xlen == 8) return;
+
+    buf[2]  = hexchars [(val >> 12) & 0xF];
+    buf[3]  = hexchars [(val >>  8) & 0xF];
+    if (xlen == 16) return;
+
+    buf[4]  = hexchars [(val >> 20) & 0xF];
+    buf[5]  = hexchars [(val >> 16) & 0xF];
+    buf[6]  = hexchars [(val >> 28) & 0xF];
+    buf[7]  = hexchars [(val >> 24) & 0xF];
+    if (xlen == 32) return;
+
+    buf[8]  = hexchars [(val >> 36) & 0xF];
+    buf[9]  = hexchars [(val >> 32) & 0xF];
+    buf[10] = hexchars [(val >> 44) & 0xF];
+    buf[11] = hexchars [(val >> 40) & 0xF];
+    buf[12] = hexchars [(val >> 52) & 0xF];
+    buf[13] = hexchars [(val >> 48) & 0xF];
+    buf[14] = hexchars [(val >> 60) & 0xF];
+    buf[15] = hexchars [(val >> 56) & 0xF];
+}
 
 uint8_t gdb_checksum(const char *buf, const size_t size) {
 	uint8_t c = 0;
@@ -347,6 +378,29 @@ void handle_rsp_stop_reason(const char *buf, const size_t buf_len) {
 }
 
 
+void handle_rsp_g(const char *buf, const size_t buf_len) {
+	// called when gdb sends a 'g' reequest meaning read all registers
+	printf("handle all registers read called \n");
+	uint64_t value;
+	char response[33*16];
+	const size_t ASCII_hex_digits = 32 / (8 / 2);
+	
+	// all riscv 32 registers
+	uint8_t j;
+	for (j = 0; j < 32; j++)  {
+		value = 0;
+		val_to_hex16(value, 32, &(response[j * ASCII_hex_digits]));	
+	}
+
+	// for PC. Just sending value 0 for now
+	val_to_hex16(0, 32, &(response[32 * ASCII_hex_digits]));
+	
+	// send the final assembled response
+	send_rsp_pkt_to_gdb(response, 33 * ASCII_hex_digits);	
+}
+
+
+
 
 void handle_rsp_q(const char *buf, const size_t buf_len) {
 	printf("The handle rsp q function was called. \n");
@@ -423,14 +477,18 @@ int main(int argc, char const *argv[]) {
 			if (gdb_rsp_pkt_buf [0] == control_c) {
 				printf("got control c\n");
         	} else if (gdb_rsp_pkt_buf [0] == '?') {
+
 				printf("got ?\n");
 				handle_rsp_stop_reason(gdb_rsp_pkt_buf, n);
+
         	} else if (gdb_rsp_pkt_buf [0] == 'c') {
 				printf("got c\n");
         	} else if (gdb_rsp_pkt_buf [0] == 'D') {
 				printf("got D\n");
         	} else if (gdb_rsp_pkt_buf [0] == 'g') {
-				printf("got g\n");
+
+				handle_rsp_g(gdb_rsp_pkt_buf, n);
+
         	} else if (gdb_rsp_pkt_buf [0] == 'G') {
 				printf("got G\n");
         	} else if (gdb_rsp_pkt_buf [0] == 'm') {
